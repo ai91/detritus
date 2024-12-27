@@ -48,17 +48,18 @@
  *  * set  - enter setup mode. Analogue to pressing 'Pairing Button' on module. Can be sent to any command-topic.
  *              Example:
  *                'set' - open WiFi hotspot 'Detritus-xxxxx' will be enabled for 3 minutes. After 3 minutes will exit setup mode.
- * 
+ *  * ota  - enter OTA mode.
  * 
  * Author: Anar Ibragimoff (anar@ibn.by)
  * 
  */
-#include <FS.h>                 // this needs to be first, or it all crashes and burns...
+#include <LittleFS.h>
 
 #include <ESP8266WiFi.h>        // https://github.com/esp8266/Arduino
 #include <DNSServer.h>          // Local DNS Server used for redirecting all requests to the configuration portal
 #include <ESP8266WebServer.h>   // Local WebServer used to serve the configuration portal
 #include <WiFiManager.h>        // https://github.com/tzapu/WiFiManager/tree/development
+#include <ArduinoOTA.h>
 
 #include <Ticker.h>
 
@@ -77,6 +78,7 @@
 #define BUTTON 13
 
 #define CONFIG_TIMEOUT_MS 300000
+#define OTA_TIMEOUT_MS 300000
 
 #define LOOP_DELAY_MS 10
 #define MANUAL_SETUP_MAX_DELAY_MS 500
@@ -86,6 +88,8 @@
 #define CMD_ON "1"
 #define CMD_OFF "0"
 #define CMD_SETUP "set"
+#define CMD_OTA "ota"
+#define CMD_RESET "rst"
 
 
 // --------------------------------------------------
@@ -125,8 +129,10 @@ WiFiManagerParameter customRespectSwitchStateLabel("respect switch states");
 WiFiManagerParameter customInvertSwitch("invert_switch", "", CHECKBOX, 70);
 WiFiManagerParameter customInvertSwitchLabel("invert switch keys");
 bool wifiManagerSetupRunning = false;
-bool restart = false;
 unsigned long wifiManagerSetupStart;
+bool otaRunning = false;
+unsigned long otaStart;
+bool restart = false;
 
 PubSubClient mqttClient(espClient);
 unsigned long mqttConnectAttempt = 0;
@@ -173,20 +179,41 @@ void setup() {
   // MQTT connection
   mqttClient.setCallback(mqttCallback);
 
+  // OTA progress
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (digitalRead(LED_BUILTIN) == HIGH) {
+      digitalWrite(LED_BUILTIN, LOW);
+    } else {
+      digitalWrite(LED_BUILTIN, HIGH);
+    }
+  });
+
 }
 
 void loop() {
 
-  gpioLoop();
+  if (otaRunning) {
+    
+    ArduinoOTA.handle();
 
-  wifimanagerLoop();
-
-  if (!offline) {
-    mqttLoop();
+    if ((millis() - otaStart) > OTA_TIMEOUT_MS) {
+      restart = true;
+    }
+    
+  } else {
+    
+    gpioLoop();
+  
+    wifimanagerLoop();
+  
+    if (!offline) {
+      mqttLoop();
+    }
+  
+    // try to save power by delaying, which forces a light sleep mode.
+    delay(LOOP_DELAY_MS);
+    
   }
-
-  // try to save power by delaying, which forces a light sleep mode.
-  delay(LOOP_DELAY_MS);
 
   if (restart) {
     ESP.restart();
@@ -406,7 +433,7 @@ void saveParamsCallback () {
   json["respect_switch_state"] = respectSwitchState ? "true" : "false";
   json["invert_switch"] = invertSwitch ? "true" : "false";
 
-  File configFile = SPIFFS.open(CONFIG_FILE, "w");
+  File configFile = LittleFS.open(CONFIG_FILE, "w");
   serializeJson(json, configFile);
   configFile.close();
   //end save
@@ -441,10 +468,10 @@ void startWifiManager(boolean onDemand) {
     String apName = "Detritus-" + String(ESP.getChipId(), HEX);
     strcpy(mqttClientName, apName.c_str());
     
-    if (SPIFFS.begin()) {
-      if (SPIFFS.exists("/config.json")) {
+    if (LittleFS.begin()) {
+      if (LittleFS.exists("/config.json")) {
         //file exists, reading and loading
-        File configFile = SPIFFS.open(CONFIG_FILE, "r");
+        File configFile = LittleFS.open(CONFIG_FILE, "r");
         if (configFile) {
           size_t size = configFile.size();
           // Allocate a buffer to store contents of the file.
@@ -473,6 +500,7 @@ void startWifiManager(boolean onDemand) {
     //end read
   
     WiFi.hostname(mqttClientName);
+    ArduinoOTA.setHostname(mqttClientName);
   
     customMqttServer.setValue(mqttServer, 40);
     customMqttPort.setValue(mqttPort, 6);
@@ -606,6 +634,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String cmd = String(payloadCopy);
   if (cmd.startsWith(CMD_SETUP)){
     startWifiManager(true);
+  }
+
+  if (cmd.startsWith(CMD_RESET)){
+    restart = true;
+  }
+
+  if (cmd.startsWith(CMD_OTA)){
+    otaStart = millis();
+    otaRunning = true;
+    ledTicker.attach_ms(300, ledTick); // start fast blinking
+    ArduinoOTA.begin();
   }
 
   if(strcmp(topic, mqttInTopic1) == 0) {
